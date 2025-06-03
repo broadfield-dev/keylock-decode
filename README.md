@@ -16,7 +16,7 @@ It assumes the data was embedded using a compatible LSB (Least Significant Bit) 
 Install "KeyLock-Decode" directly from GitHub (once the repository is public):
 
 ```bash
-pip install git+https://github.com/broaddfield-dev/keylock-decode.git
+pip install git+https://github.com/broadfield-dev/keylock-decode.git
 ```
 
 Alternatively, after cloning the repository:
