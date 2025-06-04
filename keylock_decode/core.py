@@ -1,200 +1,276 @@
+# keylock/core.py
+import io
+import json
 import os
 import struct
-import json
 import logging
+import traceback
+import base64
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.exceptions import InvalidTag
-from PIL import Image
+
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
 logger = logging.getLogger(__name__)
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(module)s - %(lineno)d - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
-# --- Constants for cryptographic operations and LSB steganography ---
-SALT_SIZE = 16
-NONCE_SIZE = 12 # Recommended for AES-GCM
-TAG_SIZE = 16   # AES-GCM authentication tag size
-KEY_SIZE = 32   # For AES-256
-PBKDF2_ITERATIONS = 390_000 # OWASP recommendation (as of late 2023/early 2024)
-LENGTH_HEADER_SIZE = 4  # Bytes to store the length of the embedded payload
+SALT_SIZE = 16; NONCE_SIZE = 12; TAG_SIZE = 16; KEY_SIZE = 32
+PBKDF2_ITERATIONS = 390_000; LENGTH_HEADER_SIZE = 4
+PREFERRED_FONTS = ["Verdana", "Arial", "DejaVu Sans", "Calibri", "Helvetica", "Roboto-Regular", "sans-serif"]
+MAX_KEYS_TO_DISPLAY_OVERLAY = 12
 
-# --- Internal Cryptography ---
-def _derive_key(password: str, salt: bytes) -> bytes:
-    """Derives a 256-bit cryptographic key from a password and salt using PBKDF2-HMAC-SHA256."""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=KEY_SIZE,
-        salt=salt,
-        iterations=PBKDF2_ITERATIONS,
-    )
-    return kdf.derive(password.encode('utf-8'))
+def _get_font(preferred_fonts, base_size):
+    fp = None
+    for n in preferred_fonts:
+        try: ImageFont.truetype(n.lower()+".ttf",10); fp=n.lower()+".ttf"; break
+        except IOError:
+            try: ImageFont.truetype(n,10); fp=n; break
+            except IOError: continue
+    if fp:
+        try: return ImageFont.truetype(fp, int(base_size)) # Ensure integer size
+        except IOError: logger.warning(f"Font '{fp}' load failed with size {base_size}. Defaulting.")
+    return ImageFont.load_default() # load_default does not take size argument in older Pillow
 
-def _decrypt_data(encrypted_payload: bytes, password: str) -> bytes:
-    """Decrypts payload (salt + nonce + ciphertext_with_tag) using AES-GCM."""
-    if len(encrypted_payload) < SALT_SIZE + NONCE_SIZE + TAG_SIZE: # Basic sanity check
-        raise ValueError("Encrypted payload is too short for valid salt, nonce, and GCM tag.")
+def set_pil_image_format_to_png(image:Image.Image)->Image.Image:
+    buf=io.BytesIO(); image.save(buf,format='PNG'); buf.seek(0)
+    reloaded=Image.open(buf); reloaded.format="PNG"; return reloaded
+
+def _derive_key(pw:str,salt:bytes)->bytes:
+    kdf=PBKDF2HMAC(algorithm=hashes.SHA256(),length=KEY_SIZE,salt=salt,iterations=PBKDF2_ITERATIONS)
+    return kdf.derive(pw.encode('utf-8'))
+
+def encrypt_data(data:bytes,pw:str)->bytes:
+    s=os.urandom(SALT_SIZE);k=_derive_key(pw,s);a=AESGCM(k);n=os.urandom(NONCE_SIZE)
+    ct=a.encrypt(n,data,None); return s+n+ct
+
+def decrypt_data(payload:bytes,pw:str)->bytes:
+    ml=SALT_SIZE+NONCE_SIZE+TAG_SIZE;
+    if len(payload)<ml: raise ValueError("Payload too short.")
+    s,n,ct_tag=payload[:SALT_SIZE],payload[SALT_SIZE:SALT_SIZE+NONCE_SIZE],payload[SALT_SIZE+NONCE_SIZE:]
+    k=_derive_key(pw,s);a=AESGCM(k)
+    try: return a.decrypt(n,ct_tag,None)
+    except InvalidTag: raise ValueError("Decryption failed: Invalid password/corrupted data.")
+    except Exception as e: logger.error(f"Decrypt error: {e}",exc_info=True); raise
+
+def _d2b(d:bytes)->str: return ''.join(format(b,'08b') for b in d)
+def _b2B(b:str)->bytes:
+    if len(b)%8!=0: raise ValueError("Bits not multiple of 8.")
+    return bytes(int(b[i:i+8],2) for i in range(0,len(b),8))
+
+def embed_data_in_image(img_obj:Image.Image,data:bytes)->Image.Image:
+    img=img_obj.convert("RGB");px=np.array(img);fpx=px.ravel()
+    lb=struct.pack('>I',len(data));fp=lb+data;db=_d2b(fp);nb=len(db)
+    if nb>len(fpx): raise ValueError(f"Data too large: {nb} bits needed, {len(fpx)} available.")
+    for i in range(nb): fpx[i]=(fpx[i]&0xFE)|int(db[i])
+    spx=fpx.reshape(px.shape); return Image.fromarray(spx.astype(np.uint8),'RGB')
+
+def extract_data_from_image(img_obj:Image.Image)->bytes:
+    img=img_obj.convert("RGB");px=np.array(img);fpx=px.ravel()
+    hbc=LENGTH_HEADER_SIZE*8
+    if len(fpx)<hbc: raise ValueError("Image too small for header.")
+    lb="".join(str(fpx[i]&1) for i in range(hbc))
+    try: pl=struct.unpack('>I',_b2B(lb))[0]
+    except Exception as e: raise ValueError(f"Header decode error: {e}")
+    if pl==0: return b""
+    if pl>(len(fpx)-hbc)/8: raise ValueError("Header len corrupted or > capacity.")
+    tpb=pl*8; so=hbc; eo=so+tpb
+    if len(fpx)<eo: raise ValueError("Image truncated or header corrupted.")
+    pb="".join(str(fpx[i]&1) for i in range(so,eo)); return _b2B(pb)
+
+def parse_kv_string_to_dict(kv_str:str)->dict:
+    if not kv_str or not kv_str.strip(): return {}
+    dd={};
+    for ln,ol in enumerate(kv_str.splitlines(),1):
+        l=ol.strip()
+        if not l or l.startswith('#'): continue
+        lc=l.split('#',1)[0].strip();
+        if not lc: continue
+        p=lc.split('=',1) if '=' in lc else lc.split(':',1) if ':' in lc else []
+        if len(p)!=2: raise ValueError(f"L{ln}: Invalid format '{ol}'.")
+        k,v=p[0].strip(),p[1].strip()
+        if not k: raise ValueError(f"L{ln}: Empty key in '{ol}'.")
+        if len(v)>=2 and v[0]==v[-1] and v.startswith(("'",'"')): v=v[1:-1]
+        dd[k]=v
+    return dd
+
+def generate_keylock_carrier_image(w=800,h=600,msg="KeyLock Wallet")->Image.Image:
+    cs,ce=(30,40,50),(70,80,90);img=Image.new("RGB",(w,h),cs);draw=ImageDraw.Draw(img)
+    for y_ in range(h):
+        i=y_/float(h-1) if h>1 else .5;r_,g_,b_=(int(s_*(1-i)+e_*(i)) for s_,e_ in zip(cs,ce))
+        draw.line([(0,y_),(w,y_)],fill=(r_,g_,b_))
+    ib=min(w,h)//7;icx,icy=w//2,h//3;cr=ib//2;cb=[(icx-cr,icy-cr),(icx+cr,icy+cr)]
+    rw,rh=ib//4,ib//2;rty=icy+int(cr*.2);rb=[(icx-rw//2,rty),(icx+rw//2,rty+rh)]
+    kc,ko=(190,195,200),(120,125,130);ow=max(1,int(ib/30))
+    draw.ellipse(cb,fill=kc,outline=ko,width=ow);draw.rectangle(rb,fill=kc,outline=ko,width=ow)
+    fs=max(16,min(int(w/18),h//8));fnt=_get_font(PREFERRED_FONTS,fs)
+    tc=(225,230,235);sc=(max(0,s_-20) for s_ in cs);tx,ty=w/2,h*.68;so=max(1,int(fs/25))
+    try:draw.text((tx+so,ty+so),msg,font=fnt,fill=tuple(sc),anchor="mm");draw.text((tx,ty),msg,font=fnt,fill=tc,anchor="mm")
+    except AttributeError:
+        bbox_textsize = fnt.getbbox(msg) if hasattr(fnt, 'getbbox') else (0,0) + draw.textsize(msg, font=fnt)
+        tw,th=bbox_textsize[2]-bbox_textsize[0],bbox_textsize[3]-bbox_textsize[1]
+        ax,ay=(w-tw)/2,ty-(th/2)
+        draw.text((ax+so,ay+so),msg,font=fnt,fill=tuple(sc));draw.text((ax,ay),msg,font=fnt,fill=tc) # Note: textsize/getbbox might not fully match anchor="mm" vertical alignment.
+    return img
+
+def _get_text_width(draw_obj, text_str, font_obj):
+    if hasattr(font_obj, 'getlength'): # Pillow 10.0.0+ moved getlength to font object
+        return font_obj.getlength(text_str)
+    elif hasattr(draw_obj, 'textlength'):  # Pillow 9.2.0+
+        return draw_obj.textlength(text_str, font=font_obj)
+    elif hasattr(draw_obj, 'textbbox'): # Pillow 8.0.0+
+        bbox = draw_obj.textbbox((0, 0), text_str, font=font_obj)
+        return bbox[2] - bbox[0]
+    else:  # Older Pillow
+        try:
+            width, _ = draw_obj.textsize(text_str, font=font_obj)
+            return width
+        except AttributeError: # If draw_obj itself doesn't have textsize (e.g. very old PIL)
+            if hasattr(font_obj, 'getsize'): # font.getsize()
+                width, _ = font_obj.getsize(text_str)
+                return width
+            return 20 # fallback
+
+def _get_text_height(draw_obj, text_str, font_obj):
+    if hasattr(draw_obj, 'textbbox'): # Pillow 8.0.0+
+        bbox = draw_obj.textbbox((0,0), text_str, font=font_obj) # Using (0,0) as anchor for simplicity
+        return bbox[3] - bbox[1] # height = bottom - top
+    else: # Older Pillow
+        try:
+            _, height = draw_obj.textsize(text_str, font=font_obj)
+            return height
+        except AttributeError:
+            if hasattr(font_obj, 'getsize'):
+                _, height = font_obj.getsize(text_str)
+                return height
+            return 10 # fallback
+
+
+def draw_key_list_dropdown_overlay(image: Image.Image, keys: list[str] = None, title: str = "Data Embedded") -> Image.Image:
+    if not title and (keys is None or not keys):
+        return set_pil_image_format_to_png(image.copy())
+
+    img_overlayed = image.copy(); draw = ImageDraw.Draw(img_overlayed)
+    margin = 10; padding = {'title_x':10,'title_y':6,'key_x':10,'key_y':5}; line_spacing = 4
+    title_bg_color=(60,60,60); title_text_color=(230,230,90)
+    key_list_bg_color=(50,50,50); key_text_color=(210,210,210); ellipsis_color=(170,170,170)
     
-    salt = encrypted_payload[:SALT_SIZE]
-    nonce = encrypted_payload[SALT_SIZE : SALT_SIZE + NONCE_SIZE]
-    ciphertext_with_tag = encrypted_payload[SALT_SIZE + NONCE_SIZE:]
+    # --- Overlay Width Calculation ---
+    OVERLAY_TARGET_WIDTH_RATIO = 0.30
+    MIN_OVERLAY_WIDTH_PX = 180 # Increased minimum width
+    MAX_OVERLAY_WIDTH_PX = 500 # Increased maximum width
+
+    overlay_box_width = int(image.width * OVERLAY_TARGET_WIDTH_RATIO)
+    overlay_box_width = max(MIN_OVERLAY_WIDTH_PX, overlay_box_width)
+    overlay_box_width = min(MAX_OVERLAY_WIDTH_PX, overlay_box_width)
+    overlay_box_width = min(overlay_box_width, image.width - 2 * margin) # Ensure it fits
+
+    # --- Font Size Calculations ---
+    TITLE_FONT_HEIGHT_RATIO = 0.030 # Fraction of image height for font sizing
+    TITLE_FONT_OVERLAY_WIDTH_RATIO = 0.08 # Fraction of overlay_box_width for font sizing
+    MIN_TITLE_FONT_SIZE = 14
+    MAX_TITLE_FONT_SIZE = 28
+
+    title_font_size_from_h = int(image.height * TITLE_FONT_HEIGHT_RATIO)
+    title_font_size_from_w = int(overlay_box_width * TITLE_FONT_OVERLAY_WIDTH_RATIO)
+    title_font_size = min(title_font_size_from_h, title_font_size_from_w)
+    title_font_size = max(MIN_TITLE_FONT_SIZE, title_font_size)
+    title_font_size = min(MAX_TITLE_FONT_SIZE, title_font_size)
+    title_font = _get_font(PREFERRED_FONTS, title_font_size)
+
+    KEY_FONT_HEIGHT_RATIO = 0.025
+    KEY_FONT_OVERLAY_WIDTH_RATIO = 0.07
+    MIN_KEY_FONT_SIZE = 12
+    MAX_KEY_FONT_SIZE = 22
+
+    key_font_size_from_h = int(image.height * KEY_FONT_HEIGHT_RATIO)
+    key_font_size_from_w = int(overlay_box_width * KEY_FONT_OVERLAY_WIDTH_RATIO)
+    key_font_size = min(key_font_size_from_h, key_font_size_from_w)
+    key_font_size = max(MIN_KEY_FONT_SIZE, key_font_size)
+    key_font_size = min(MAX_KEY_FONT_SIZE, key_font_size)
+    key_font = _get_font(PREFERRED_FONTS, key_font_size)
     
-    key = _derive_key(password, salt)
-    aesgcm = AESGCM(key)
-    try:
-        return aesgcm.decrypt(nonce, ciphertext_with_tag, None) # No AAD
-    except InvalidTag: # This indicates decryption failure (wrong key or tampered data)
-        raise ValueError("Decryption failed: Invalid password or corrupted data (GCM tag mismatch).")
+    # --- Text dimensions ---
+    actual_title_w = _get_text_width(draw, title, title_font)
+    actual_title_h = _get_text_height(draw, title, title_font)
 
-# --- Internal Bit/Byte Manipulation ---
-def _bits_to_bytes(bits: str) -> bytes:
-    """Converts a string of '0's and '1's to a byte string."""
-    if len(bits) % 8 != 0:
-        raise ValueError("Bit string length must be a multiple of 8 for byte conversion.")
-    return bytes(int(bits[i:i+8], 2) for i in range(0, len(bits), 8))
+    disp_keys, actual_key_text_widths, total_keys_render_h, key_line_heights = [],[],0,[]
+    if keys:
+        temp_disp_keys=keys[:MAX_KEYS_TO_DISPLAY_OVERLAY-1]+[f"... ({len(keys)-(MAX_KEYS_TO_DISPLAY_OVERLAY-1)} more)"] if len(keys)>MAX_KEYS_TO_DISPLAY_OVERLAY else keys
+        for kt in temp_disp_keys:
+            disp_keys.append(kt)
+            kw = _get_text_width(draw, kt, key_font)
+            kh = _get_text_height(draw, kt, key_font)
+            actual_key_text_widths.append(kw); key_line_heights.append(kh)
+            total_keys_render_h += kh
+        if len(disp_keys)>1: total_keys_render_h += line_spacing*(len(disp_keys)-1)
+    
+    # --- Title Bar Drawing ---
+    title_bar_h = actual_title_h + 2*padding['title_y']
+    title_bar_x0 = margin
+    title_bar_x1 = title_bar_x0 + overlay_box_width
+    title_bar_y0 = margin
+    title_bar_y1 = title_bar_y0 + title_bar_h
+    
+    draw.rectangle([(title_bar_x0,title_bar_y0),(title_bar_x1,title_bar_y1)],fill=title_bg_color)
+    
+    available_width_for_title_text = overlay_box_width - 2 * padding['title_x']
+    if actual_title_w <= available_width_for_title_text:
+        title_text_draw_x = title_bar_x0 + padding['title_x'] + (available_width_for_title_text - actual_title_w) / 2
+    else: # If title is wider than available space (even after font adjustments), left-align
+        title_text_draw_x = title_bar_x0 + padding['title_x']
+    title_text_draw_y = title_bar_y0 + padding['title_y']
+    draw.text((title_text_draw_x, title_text_draw_y), title, font=title_font, fill=title_text_color)
 
-# --- Internal LSB Extraction ---
-def _extract_encrypted_payload_from_image(image_pil: Image.Image) -> bytes:
-    """Extracts the raw encrypted payload (length-prefixed) from image LSBs."""
-    try:
-        img_rgb = image_pil.convert("RGB") # Ensure consistent 3-channel format
-    except Exception as e:
-        raise IOError(f"Could not process image (ensure it's a valid format): {e}")
+    # --- Key List Drawing ---
+    if disp_keys:
+        key_list_box_h_ideal = total_keys_render_h + 2*padding['key_y']
+        key_list_x0, key_list_x1 = title_bar_x0, title_bar_x1
+        key_list_y0 = title_bar_y1 
+        key_list_y1 = key_list_y0 + key_list_box_h_ideal
         
-    pixels = np.array(img_rgb)
-    flat_pixels = pixels.ravel() # R,G,B,R,G,B...
+        key_list_y1 = min(key_list_y1, image.height - margin) # Ensure it fits vertically
+        current_key_list_box_h = key_list_y1 - key_list_y0
 
-    len_header_bits_count = LENGTH_HEADER_SIZE * 8
-    if len(flat_pixels) < len_header_bits_count:
-        raise ValueError("Image is too small to contain a payload length header.")
-    
-    # Extract bits for the length header
-    len_bits = "".join(map(str, (flat_pixels[i] & 1 for i in range(len_header_bits_count))))
-    
-    try:
-        payload_len_bytes = _bits_to_bytes(len_bits)
-        encrypted_payload_len = struct.unpack('>I', payload_len_bytes)[0] # Big-endian unsigned int
-    except Exception as e: # Handles errors from _bits_to_bytes or struct.unpack
-        raise ValueError(f"Could not decode payload length from image header: {e}")
-
-    logger.info(f"Decoded payload length from header: {encrypted_payload_len} bytes.")
-
-    # Validate decoded length against image capacity
-    max_possible_payload_bytes = (len(flat_pixels) - len_header_bits_count) // 8
-    if encrypted_payload_len > max_possible_payload_bytes:
-        raise ValueError(f"Data length header ({encrypted_payload_len} bytes) exceeds image capacity ({max_possible_payload_bytes} bytes).")
-    if encrypted_payload_len == 0:
-        return b"" # No payload to extract
-
-    # Extract the payload bits
-    total_payload_bits_to_extract = encrypted_payload_len * 8
-    start_idx = len_header_bits_count
-    end_idx = start_idx + total_payload_bits_to_extract
-
-    if len(flat_pixels) < end_idx: # Should be caught by previous check, but good for robustness
-        raise ValueError("Image appears truncated or data length header corrupted during payload extraction.")
-
-    payload_bits = "".join(map(str, (flat_pixels[i] & 1 for i in range(start_idx, end_idx))))
-    extracted_payload = _bits_to_bytes(payload_bits)
-    
-    # Final sanity check on extracted length
-    if len(extracted_payload) != encrypted_payload_len:
-        raise ValueError("Internal consistency error: Mismatch in extracted payload length vs. expected length.")
+        draw.rectangle([(key_list_x0,key_list_y0),(key_list_x1,key_list_y1)],fill=key_list_bg_color)
         
-    return extracted_payload
+        current_text_y = key_list_y0 + padding['key_y']
+        available_text_width_for_keys = overlay_box_width - 2 * padding['key_x']
 
-# --- Public Decoding Functions ---
-def decode_from_image_pil(stego_image_pil: Image.Image, password: str, set_environment_variables: bool = False) -> tuple[dict, list[str]]:
-    """
-    Decodes data from a steganographic PIL Image object.
-
-    Args:
-        stego_image_pil: The PIL.Image.Image object containing the steganographic data.
-        password: The password used for decryption.
-        set_environment_variables: If True, attempts to set the decoded key-value pairs
-                                   as environment variables for the current process.
-                                   WARNING: Use with extreme caution due to security risks.
-
-    Returns:
-        A tuple: (decoded_dictionary, list_of_status_messages).
-                 The dictionary contains the decoded key-value pairs.
-                 The list contains human-readable status messages about the process.
-
-    Raises:
-        TypeError: If stego_image_pil is not a PIL.Image.Image object.
-        IOError: If the image cannot be processed.
-        ValueError: For various decoding, decryption, or data format errors.
-    """
-    logger.info("Starting decoding process from PIL Image object.")
-    status_messages = []
-
-    if not isinstance(stego_image_pil, Image.Image): # Type check for robustness
-        raise TypeError("Input 'stego_image_pil' must be a PIL.Image.Image object.")
-
-    encrypted_payload = _extract_encrypted_payload_from_image(stego_image_pil)
-    if not encrypted_payload: # Payload length was 0
-        msg = "No payload data found in the image (payload length was zero)."
-        logger.info(msg)
-        status_messages.append(msg)
-        return {}, status_messages # Return empty dict and status
-
-    decrypted_data_bytes = _decrypt_data(encrypted_payload, password)
-
-    try:
-        final_data_dict = json.loads(decrypted_data_bytes.decode('utf-8'))
-        status_messages.append("Data successfully decrypted and deserialized.")
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Decrypted data is not valid JSON: {e}. Raw (hex): {decrypted_data_bytes.hex()}")
-    except UnicodeDecodeError as e:
-        raise ValueError(f"Decrypted data is not valid UTF-8: {e}. Raw (hex): {decrypted_data_bytes.hex()}")
-
-    if set_environment_variables:
-        logger.warning("Attempting to set environment variables from decoded data. This can be a security risk.")
-        env_vars_set_count = 0
-        if not final_data_dict:
-            status_messages.append("Decoded data is empty, no environment variables to set.")
-        else:
-            for key, value in final_data_dict.items():
-                s_key = str(key) # Ensure keys are strings for os.environ
-                s_value = str(value) # Ensure values are strings for os.environ
-                
-                if not isinstance(key, str) or not isinstance(value, str):
-                    status_messages.append(f"Warning: Original key/value ({key!r}/{value!r}) not both strings, converted for env var: {s_key}='{s_value}'")
-                try:
-                    os.environ[s_key] = s_value
-                    status_messages.append(f"Environment variable set: {s_key}='***' (value hidden for security in logs)") # Avoid logging sensitive values
-                    logger.info(f"Environment variable set: {s_key} (value omitted from log)")
-                    env_vars_set_count += 1
-                except Exception as e: # Catch potential errors during os.environ assignment
-                    err_msg = f"Failed to set environment variable {s_key}: {e}"
-                    logger.error(err_msg)
-                    status_messages.append(f"Error: {err_msg}")
+        for i, key_text_item in enumerate(disp_keys):
+            if i >= len(key_line_heights): break 
             
-            if env_vars_set_count > 0:
-                 status_messages.append(f"Successfully set {env_vars_set_count} environment variable(s).")
-            elif final_data_dict: # If data dict was not empty but nothing was set
-                 status_messages.append("No valid (string key/value) environment variables were set from the decoded data.")
-    
-    return final_data_dict, status_messages
-
-
-def decode_from_image_path(stego_image_path: str, password: str, set_environment_variables: bool = False) -> tuple[dict, list[str]]:
-    """
-    Convenience function to decode data from an image file path.
-    Opens the image and then calls decode_from_image_pil.
-    """
-    logger.info(f"Attempting to decode from image path: {stego_image_path}")
-    try:
-        stego_image_pil = Image.open(stego_image_path)
-    except FileNotFoundError:
-        logger.error(f"Image file not found: {stego_image_path}")
-        raise # Re-raise FileNotFoundError to be handled by caller
-    except Exception as e: # Catch other PIL opening errors
-        logger.error(f"Could not open or read image file '{stego_image_path}': {e}")
-        raise IOError(f"Could not open or read image file '{stego_image_path}': {e}")
-    
-    # It can be useful to attach the filename to the PIL object for context, though not strictly necessary
-    # if not hasattr(stego_image_pil, 'filename') or not stego_image_pil.filename:
-    #    stego_image_pil.filename = stego_image_path
-        
-    return decode_from_image_pil(stego_image_pil, password, set_environment_variables)
+            current_key_h = key_line_heights[i]
+            if current_text_y + current_key_h > key_list_y0 + current_key_list_box_h - padding['key_y']:
+                ellipsis_h = _get_text_height(draw,"...",key_font)
+                if current_text_y + ellipsis_h <= key_list_y0 + current_key_list_box_h - padding['key_y']:
+                    ellipsis_w = _get_text_width(draw,"...",key_font)
+                    draw.text((key_list_x0 + (overlay_box_width - ellipsis_w)/2, current_text_y), "...", font=key_font, fill=ellipsis_color)
+                break 
+            
+            original_key_text_w = actual_key_text_widths[i]
+            text_to_draw = key_text_item
+            
+            if original_key_text_w > available_text_width_for_keys:
+                temp_text = key_text_item
+                while _get_text_width(draw, temp_text + "...", key_font) > available_text_width_for_keys and len(temp_text) > 0:
+                    temp_text = temp_text[:-1]
+                text_to_draw = temp_text + "..." if len(temp_text) < len(key_text_item) else temp_text
+            
+            final_key_text_w = _get_text_width(draw, text_to_draw, key_font)
+            key_text_draw_x = key_list_x0 + padding['key_x'] + max(0, (available_text_width_for_keys - final_key_text_w) / 2)
+            
+            text_color_to_use = ellipsis_color if "..." in text_to_draw or f"... ({len(keys)-(MAX_KEYS_TO_DISPLAY_OVERLAY-1)} more)" in key_text_item else key_text_color
+            draw.text((key_text_draw_x, current_text_y), text_to_draw, font=key_font, fill=text_color_to_use)
+            current_text_y += current_key_h
+            if i < len(disp_keys)-1: current_text_y += line_spacing
+            
+    return set_pil_image_format_to_png(img_overlayed)
